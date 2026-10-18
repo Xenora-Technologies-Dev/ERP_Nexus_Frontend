@@ -45,6 +45,7 @@ import DocumentTemplatesPage from './pages/settings/DocumentTemplatesPage';
 import DocumentNotesPage from './pages/settings/DocumentNotesPage';
 import TermsPage from './pages/settings/TermsPage';
 import NotificationsPage from './pages/notifications/NotificationsPage';
+import ReportsPage from './pages/reports/ReportsPage';
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
   const { user, loading } = useAuth();
@@ -106,6 +107,8 @@ export default function App() {
         <Route path="accounts/reports" element={<AccountReportsPage />} />
         <Route path="accounts/ledgers" element={<LedgersPage />} />
         <Route path="credit-control" element={<CreditControlPage />} />
+        <Route path="reports" element={<Navigate to="/reports/customer-statement" replace />} />
+        <Route path="reports/:report" element={<ReportsPage />} />
         <Route path="settings/company" element={<CompanySettingsPage />} />
         <Route path="settings/templates" element={<DocumentTemplatesPage />} />
         <Route path="settings/notes" element={<DocumentNotesPage />} />

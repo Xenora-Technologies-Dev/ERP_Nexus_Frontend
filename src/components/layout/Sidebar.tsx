@@ -6,7 +6,7 @@ import {
 import {
   Dashboard, Settings, People, Store, Inventory, PointOfSale,
   ShoppingCart, AccountBalance, CreditScore, Description, Notifications,
-  ExpandLess, ExpandMore, Receipt, LocalShipping, RequestQuote,
+  ExpandLess, ExpandMore, Receipt, LocalShipping, RequestQuote, Assessment,
 } from '@mui/icons-material';
 import { useState } from 'react';
 import { brandColors, APP_VERSION, APP_NAME } from '../../theme';
@@ -76,6 +76,14 @@ const navItems: NavItem[] = [
   },
   { title: 'Credit Control', path: '/credit-control', icon: <CreditScore /> },
   {
+    title: 'Reports', icon: <Assessment />,
+    children: [
+      { title: 'Customer Statement', path: '/reports/customer-statement' },
+      { title: 'Customer Payments', path: '/reports/customer-payments' },
+      { title: 'Sales Report', path: '/reports/sales' },
+    ],
+  },
+  {
     title: 'Settings', icon: <Settings />,
     children: [
       { title: 'Company Settings', path: '/settings/company' },
@@ -99,7 +107,7 @@ export default function Sidebar({ open, onClose }: Props) {
   const location = useLocation();
   const theme = useTheme();
   const isMobile = useMediaQuery(theme.breakpoints.down('md'));
-  const [expanded, setExpanded] = useState<Record<string, boolean>>({ Inventory: true, Sales: true, Purchase: true, Accounts: true, Settings: true });
+  const [expanded, setExpanded] = useState<Record<string, boolean>>({ Inventory: true, Sales: true, Purchase: true, Accounts: true, Reports: true, Settings: true });
 
   const handleNav = (path: string) => {
     navigate(path);
