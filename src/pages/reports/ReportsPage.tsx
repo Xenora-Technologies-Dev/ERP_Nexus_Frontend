@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import {
   Box, Card, CardContent, Tabs, Tab, Grid, TextField, MenuItem, Button, Autocomplete,
@@ -21,6 +21,21 @@ const PAYMENT_METHODS = ['CASH', 'CHEQUE', 'BANK_TRANSFER'];
 const INVOICE_STATUSES = ['CONFIRMED', 'PARTIALLY_PAID', 'PAID', 'DRAFT', 'CANCELLED'];
 
 interface Opt { id: string; code?: string; sku?: string; name: string }
+
+function asOptions(body: unknown): Opt[] {
+  const list = Array.isArray(body)
+    ? body
+    : (body && typeof body === 'object' && Array.isArray((body as { data?: unknown }).data)
+      ? (body as { data: unknown[] }).data
+      : []);
+  return list.filter((o): o is Opt => !!o && typeof o === 'object' && typeof (o as Opt).id === 'string');
+}
+
+function optionLabel(o?: { name?: string; code?: string; sku?: string } | null, extra?: 'code' | 'sku') {
+  if (!o) return '';
+  const suffix = extra === 'sku' ? o.sku : o.code;
+  return `${o.name ?? ''}${suffix ? ` (${suffix})` : ''}`;
+}
 
 const money = (n?: number | null) =>
   n === null || n === undefined ? '' : Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -107,13 +122,24 @@ export default function ReportsPage() {
   const [exporting, setExporting] = useState(false);
   const [error, setError] = useState('');
 
-  useEffect(() => {
-    api.get('/customers', { params: { active: true } }).then((r) => setCustomers(Array.isArray(r.data) ? r.data : r.data?.data ?? [])).catch(() => {});
-    api.get('/inventory/products').then((r) => setProducts(Array.isArray(r.data) ? r.data : r.data?.data ?? [])).catch(() => {});
-    api.get('/accounts/fund-accounts').then((r) => setAccounts(Array.isArray(r.data) ? r.data : [])).catch(() => {});
-  }, []);
+  const tabRef = useRef(tab);
+  tabRef.current = tab;
+  // Drop the previous report before paint. Clearing in an effect is too late:
+  // the new tab would render the old payload and crash on a missing field.
+  const [dataTab, setDataTab] = useState(tab);
+  if (dataTab !== tab) {
+    setDataTab(tab);
+    setData(null);
+    setError('');
+    setLoading(false);
+    setExporting(false);
+  }
 
-  useEffect(() => { setData(null); setError(''); }, [tab]);
+  useEffect(() => {
+    api.get('/customers', { params: { active: true } }).then((r) => setCustomers(asOptions(r.data))).catch(() => {});
+    api.get('/inventory/products').then((r) => setProducts(asOptions(r.data))).catch(() => {});
+    api.get('/accounts/fund-accounts').then((r) => setAccounts(asOptions(r.data))).catch(() => {});
+  }, []);
 
   const params = useMemo(() => {
     const p: Record<string, string> = {};
@@ -136,14 +162,28 @@ export default function ReportsPage() {
 
   const run = async () => {
     if (needsCustomer) { setError('Select a customer to generate the statement'); return; }
+    const requested = tab;
     setLoading(true); setError('');
     try {
-      const res = await api.get(`/reports/${tab}`, { params });
-      setData(res.data);
+      const res = await api.get(`/reports/${requested}`, { params });
+      if (tabRef.current !== requested) return;
+      const payload = res.data;
+      const mismatch = requested === 'customer-statement'
+        ? !payload?.customer || !Array.isArray(payload?.lines)
+        : requested === 'customer-payments'
+          ? !Array.isArray(payload?.rows) || !Array.isArray(payload?.byMethod)
+          : !Array.isArray(payload?.rows) || !Array.isArray(payload?.byProduct);
+      if (!payload || typeof payload !== 'object' || mismatch) {
+        setError('The report response was incomplete. Try again.');
+        setData(null);
+        return;
+      }
+      setData(payload);
     } catch (e: any) {
+      if (tabRef.current !== requested) return;
       setError(e?.response?.data?.error || 'Failed to load report');
       setData(null);
-    } finally { setLoading(false); }
+    } finally { if (tabRef.current === requested) setLoading(false); }
   };
 
   const exportXlsx = async () => {
@@ -190,7 +230,7 @@ export default function ReportsPage() {
             </Grid>
             <Grid item xs={12} sm={6} md={4}>
               <Autocomplete size="small" options={customers} value={customer} onChange={(_, v) => setCustomer(v)}
-                getOptionLabel={(o) => `${o.name}${o.code ? ` (${o.code})` : ''}`} isOptionEqualToValue={(a, b) => a.id === b.id}
+                getOptionLabel={(o) => optionLabel(o, 'code')} isOptionEqualToValue={(a, b) => a?.id === b?.id}
                 renderInput={(p) => <TextField {...p} label={tab === 'customer-statement' ? 'Customer *' : 'Customer (all)'} />} />
             </Grid>
             {tab === 'customer-payments' && (
@@ -223,7 +263,7 @@ export default function ReportsPage() {
                 </Grid>
                 <Grid item xs={12} sm={6} md={3}>
                   <Autocomplete size="small" options={products} value={product} onChange={(_, v) => setProduct(v)}
-                    getOptionLabel={(o) => `${o.name}${o.sku ? ` (${o.sku})` : ''}`} isOptionEqualToValue={(a, b) => a.id === b.id}
+                    getOptionLabel={(o) => optionLabel(o, 'sku')} isOptionEqualToValue={(a, b) => a?.id === b?.id}
                     renderInput={(p) => <TextField {...p} label="Product (all)" />} />
                 </Grid>
               </>
@@ -242,17 +282,17 @@ export default function ReportsPage() {
         <Alert severity="info">Choose filters and click Generate to preview, or Export Excel to download.</Alert>
       )}
 
-      {data && tab === 'customer-statement' && (
+      {data?.customer && Array.isArray(data.lines) && tab === 'customer-statement' && (
         <Box>
           <Typography variant="subtitle1" fontWeight={700}>{data.customer.name} ({data.customer.code})</Typography>
           <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
-            Period: {data.period.label} · Credit terms {data.customer.creditDays} days · Limit {money(data.customer.creditLimit)}
+            Period: {data.period?.label} · Credit terms {data.customer.creditDays ?? '-'} days · Limit {money(data.customer.creditLimit)}
           </Typography>
           <Stack direction="row" gap={2} flexWrap="wrap" sx={{ mb: 2 }}>
             <Stat label="Opening Balance" value={money(data.openingBalance)} />
-            <Stat label="Invoiced" value={money(data.totals.invoiced)} />
-            <Stat label="Credit Notes" value={money(data.totals.credited)} />
-            <Stat label="Received" value={money(data.totals.received)} />
+            <Stat label="Invoiced" value={money(data.totals?.invoiced)} />
+            <Stat label="Credit Notes" value={money(data.totals?.credited)} />
+            <Stat label="Received" value={money(data.totals?.received)} />
             <Stat label="Closing Balance" value={money(data.closingBalance)} />
           </Stack>
           <SimpleTable
@@ -263,10 +303,10 @@ export default function ReportsPage() {
               { key: 'debit', label: 'Debit', money: true }, { key: 'credit', label: 'Credit', money: true },
               { key: 'balance', label: 'Balance', money: true },
             ]}
-            lead={[{ date: data.period.from, description: 'Opening Balance', balance: data.openingBalance }]}
+            lead={[{ date: data.period?.from, description: 'Opening Balance', balance: data.openingBalance }]}
             rows={data.lines}
             totals={[
-              { description: 'Period Totals', debit: data.totals.debit, credit: data.totals.credit },
+              { description: 'Period Totals', debit: data.totals?.debit, credit: data.totals?.credit },
               { description: 'Closing Balance', balance: data.closingBalance },
             ]}
           />
@@ -277,17 +317,17 @@ export default function ReportsPage() {
               { key: 'days61to90', label: '61-90 Days', money: true }, { key: 'over90', label: 'Over 90 Days', money: true },
               { key: 'total', label: 'Total Outstanding', money: true },
             ]}
-            rows={[data.ageing]}
+            rows={[data.ageing ?? {}]}
           />
         </Box>
       )}
 
-      {data && tab === 'customer-payments' && (
+      {Array.isArray(data?.rows) && Array.isArray(data?.byMethod) && tab === 'customer-payments' && (
         <Box>
           <Stack direction="row" gap={2} flexWrap="wrap" sx={{ mb: 2 }}>
-            <Stat label="Receipts" value={String(data.totals.count)} />
-            <Stat label="Total Collected" value={money(data.totals.amount)} />
-            {data.byMethod.map((m: any) => <Stat key={m.label} label={m.label.replace('_', ' ')} value={money(m.amount)} />)}
+            <Stat label="Receipts" value={String(data.totals?.count ?? 0)} />
+            <Stat label="Total Collected" value={money(data.totals?.amount)} />
+            {data.byMethod.map((m: any) => <Stat key={m.label} label={String(m.label ?? '').replace('_', ' ')} value={money(m.amount)} />)}
           </Stack>
           <SimpleTable
             columns={[
@@ -298,19 +338,19 @@ export default function ReportsPage() {
               { key: 'amount', label: 'Amount', money: true },
             ]}
             rows={data.rows}
-            totals={[{ customerName: `Total (${data.totals.count} receipts)`, amount: data.totals.amount }]}
+            totals={[{ customerName: `Total (${data.totals?.count ?? 0} receipts)`, amount: data.totals?.amount }]}
           />
         </Box>
       )}
 
-      {data && tab === 'sales' && (
+      {Array.isArray(data?.rows) && Array.isArray(data?.byProduct) && tab === 'sales' && (
         <Box>
           <Stack direction="row" gap={2} flexWrap="wrap" sx={{ mb: 2 }}>
-            <Stat label="Invoices" value={String(data.totals.count)} />
-            <Stat label="Net Sales" value={money(data.totals.subtotal)} />
-            <Stat label="VAT" value={money(data.totals.vatAmount)} />
-            <Stat label="Gross Sales" value={money(data.totals.total)} />
-            <Stat label="Balance Due" value={money(data.totals.balance)} />
+            <Stat label="Invoices" value={String(data.totals?.count ?? 0)} />
+            <Stat label="Net Sales" value={money(data.totals?.subtotal)} />
+            <Stat label="VAT" value={money(data.totals?.vatAmount)} />
+            <Stat label="Gross Sales" value={money(data.totals?.total)} />
+            <Stat label="Balance Due" value={money(data.totals?.balance)} />
           </Stack>
           <Stack direction="row" gap={1} sx={{ mb: 1 }}>
             {(['invoices', 'customers', 'products'] as const).map((v) => (
@@ -328,7 +368,7 @@ export default function ReportsPage() {
                 { key: 'creditedAmount', label: 'Credited', money: true }, { key: 'balance', label: 'Balance', money: true },
               ]}
               rows={data.rows}
-              totals={[{ customerName: `Total (${data.totals.count} invoices)`, ...data.totals }]}
+              totals={[{ customerName: `Total (${data.totals?.count ?? 0} invoices)`, ...data.totals }]}
             />
           )}
           {salesView === 'customers' && (
@@ -339,8 +379,8 @@ export default function ReportsPage() {
                 { key: 'total', label: 'Total', money: true }, { key: 'paidAmount', label: 'Received', money: true },
                 { key: 'balance', label: 'Balance', money: true },
               ]}
-              rows={data.byCustomer}
-              totals={[{ customerName: 'Total', count: data.totals.count, subtotal: data.totals.subtotal, vatAmount: data.totals.vatAmount, total: data.totals.total, paidAmount: data.totals.paidAmount, balance: data.totals.balance }]}
+              rows={Array.isArray(data.byCustomer) ? data.byCustomer : []}
+              totals={[{ customerName: 'Total', count: data.totals?.count, subtotal: data.totals?.subtotal, vatAmount: data.totals?.vatAmount, total: data.totals?.total, paidAmount: data.totals?.paidAmount, balance: data.totals?.balance }]}
             />
           )}
           {salesView === 'products' && (
