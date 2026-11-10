@@ -10,7 +10,11 @@ import PageHeader from '../../components/common/PageHeader';
 import DocumentTable from '../../components/common/DocumentTable';
 import DocumentDateField from '../../components/common/DocumentDateField';
 import DocumentViewDialog from '../../components/common/DocumentViewDialog';
+import InvoiceAllocationPicker from '../../components/common/InvoiceAllocationPicker';
 import { todayISO, formatDateDDMMYYYY } from '../../utils/date';
+import {
+  AllocationLine, allocationTotal, roundMoney, validateAllocations, voucherInvoiceLabel, voucherViewItems,
+} from '../../utils/voucherAllocations';
 
 interface Vendor {
   id: string; name: string; code: string;
@@ -19,6 +23,7 @@ interface Vendor {
 }
 interface PurchaseInvoice {
   id: string; documentNumber: string; vendorId: string; total: number; paidAmount: number; debitedAmount?: number;
+  status?: string;
 }
 interface Payment {
   id: string; documentNumber: string; date: string; amount: number;
@@ -26,7 +31,9 @@ interface Payment {
   preparedBy?: string | null; approvedBy?: string | null; status?: string;
   paymentAccountId?: string | null;
   paymentAccount?: { id: string; code: string; name: string } | null;
-  vendor: Vendor; purchaseInvoice?: { documentNumber: string } | null;
+  vendor: Vendor;
+  purchaseInvoice?: { documentNumber: string } | null;
+  allocations?: { amount: number | string; purchaseInvoice?: { documentNumber: string } | null }[];
 }
 
 interface FundAccount { id: string; code: string; name: string; }
@@ -60,10 +67,12 @@ export default function PaymentsPage() {
   const [viewOpen, setViewOpen] = useState(false);
   const [viewPayment, setViewPayment] = useState<Payment | null>(null);
   const [actionId, setActionId] = useState<string | null>(null);
-  const [form, setForm] = useState({
-    vendorId: '', purchaseInvoiceId: '', date: todayISO(),
+  const emptyForm = () => ({
+    vendorId: '', date: todayISO(),
     amount: 0, paymentMethod: 'BANK_TRANSFER', paymentAccountId: '', referenceNumber: '', notes: '',
+    allocations: [] as AllocationLine[],
   });
+  const [form, setForm] = useState(emptyForm);
   const [saving, setSaving] = useState(false);
 
   const fetchData = async () => {
@@ -117,11 +126,40 @@ export default function PaymentsPage() {
     setSaving(true);
     setError('');
     try {
+      if (!form.vendorId) {
+        setError('Vendor is required');
+        return;
+      }
+      const open = vendorInvoices.map((invoice) => ({
+        id: invoice.id,
+        documentNumber: invoice.documentNumber,
+        balance: invoiceBalance(invoice),
+      }));
+      const allocationError = validateAllocations(form.allocations, open);
+      if (allocationError) {
+        setError(allocationError);
+        setSaving(false);
+        return;
+      }
+      const amount = form.allocations.length
+        ? allocationTotal(form.allocations)
+        : roundMoney(Number(form.amount));
+      if (!(amount > 0)) {
+        setError('Amount must be greater than zero');
+        setSaving(false);
+        return;
+      }
       await api.post('/purchase/payments', {
-        ...form,
-        purchaseInvoiceId: form.purchaseInvoiceId || undefined,
+        vendorId: form.vendorId,
+        date: form.date,
+        amount,
+        paymentMethod: form.paymentMethod,
         paymentAccountId: form.paymentAccountId || undefined,
-        amount: Number(form.amount),
+        referenceNumber: form.referenceNumber,
+        notes: form.notes,
+        allocations: form.allocations.length
+          ? form.allocations.map((line) => ({ purchaseInvoiceId: line.invoiceId, amount: roundMoney(line.amount) }))
+          : undefined,
       });
       setDialogOpen(false);
       setSuccess('Payment created');
@@ -134,7 +172,15 @@ export default function PaymentsPage() {
     }
   };
 
-  const vendorInvoices = invoices.filter((i) => i.vendorId === form.vendorId);
+  const invoiceBalance = (invoice: PurchaseInvoice) => roundMoney(
+    Number(invoice.total) - Number(invoice.paidAmount) - Number(invoice.debitedAmount ?? 0),
+  );
+
+  const vendorInvoices = invoices.filter((invoice) => {
+    if (invoice.vendorId !== form.vendorId) return false;
+    if (invoice.status && !['CONFIRMED', 'PARTIALLY_PAID'].includes(invoice.status)) return false;
+    return invoiceBalance(invoice) > 0.001;
+  }).sort((a, b) => a.documentNumber.localeCompare(b.documentNumber));
 
   const columns: GridColDef[] = [
     {
@@ -144,10 +190,13 @@ export default function PaymentsPage() {
     { field: 'date', headerName: 'Date', width: 110, valueFormatter: (v) => formatDateDDMMYYYY(v as string) },
     { field: 'vendor', headerName: 'Vendor', flex: 1, valueGetter: (_, row) => (row as Payment).vendor?.name },
     {
-      field: 'invoice', headerName: 'Invoice', width: 140,
+      field: 'invoice', headerName: 'Invoices', width: 220,
       valueGetter: (_, row) => {
-        const inv = (row as Payment).purchaseInvoice?.documentNumber;
-        return inv ? displayDocumentNumber(inv) : '-';
+        const payment = row as Payment;
+        const allocations = (payment.allocations || []).map((line) => ({
+          documentNumber: line.purchaseInvoice?.documentNumber,
+        }));
+        return voucherInvoiceLabel(allocations, payment.purchaseInvoice?.documentNumber);
       },
     },
     { field: 'amount', headerName: 'Amount', width: 110, type: 'number' },
@@ -175,10 +224,8 @@ export default function PaymentsPage() {
     <Box>
       <PageHeader title="Payments" subtitle="Vendor payments" actionLabel="New Payment"
         onAction={() => {
-          setForm({
-            vendorId: '', purchaseInvoiceId: '', date: todayISO(),
-            amount: 0, paymentMethod: 'BANK_TRANSFER', paymentAccountId: '', referenceNumber: '', notes: '',
-          });
+          setError('');
+          setForm(emptyForm());
           setDialogOpen(true);
         }} />
 
@@ -187,33 +234,46 @@ export default function PaymentsPage() {
 
       <DocumentTable rows={payments} columns={columns} loading={loading} />
 
-      <Dialog open={dialogOpen} onClose={() => setDialogOpen(false)} maxWidth="sm" fullWidth>
+      <Dialog open={dialogOpen} onClose={() => setDialogOpen(false)} maxWidth="md" fullWidth>
         <form onSubmit={handleCreate}>
           <DialogTitle>New Payment</DialogTitle>
           <DialogContent>
+            {error && <Alert severity="error" sx={{ mt: 1 }}>{error}</Alert>}
             <Grid container spacing={2} sx={{ mt: 0.5 }}>
               <Grid item xs={12}>
                 <Autocomplete options={vendors} getOptionLabel={(v) => `${v.code} - ${v.name}`}
                   value={vendors.find((v) => v.id === form.vendorId) || null}
-                  onChange={(_, val) => setForm({ ...form, vendorId: val?.id || '', purchaseInvoiceId: '' })}
+                  onChange={(_, val) => setForm({
+                    ...form,
+                    vendorId: val?.id || '',
+                    allocations: [],
+                    amount: form.allocations.length ? 0 : form.amount,
+                  })}
                   renderInput={(params) => <TextField {...params} required label="Vendor" />} />
               </Grid>
               <Grid item xs={12}>
-                <TextField fullWidth select label="Purchase Invoice" value={form.purchaseInvoiceId}
-                  onChange={(e) => setForm({ ...form, purchaseInvoiceId: e.target.value })}>
-                  <MenuItem value="">None</MenuItem>
-                  {vendorInvoices.map((i) => (
-                    <MenuItem key={i.id} value={i.id}>
-                      {displayDocumentNumber(i.documentNumber)} (Balance: {(
-                        Number(i.total) - Number(i.paidAmount) - Number(i.debitedAmount ?? 0)
-                      ).toFixed(2)})
-                    </MenuItem>
-                  ))}
-                </TextField>
+                <InvoiceAllocationPicker
+                  label="Purchase Invoices"
+                  partyNoun="vendor"
+                  partySelected={Boolean(form.vendorId)}
+                  invoices={vendorInvoices.map((invoice) => ({
+                    id: invoice.id,
+                    documentNumber: invoice.documentNumber,
+                    balance: invoiceBalance(invoice),
+                  }))}
+                  value={form.allocations}
+                  onChange={(allocations) => setForm({
+                    ...form,
+                    allocations,
+                    amount: allocations.length ? allocationTotal(allocations) : form.amount,
+                  })}
+                />
               </Grid>
               <Grid item xs={12} sm={6}>
-                <TextField fullWidth required label="Amount" type="number" value={form.amount}
-                  onChange={(e) => setForm({ ...form, amount: parseFloat(e.target.value) || 0 })} />
+                <TextField fullWidth required label="Amount" type="number" value={form.allocations.length ? allocationTotal(form.allocations) : form.amount}
+                  onChange={(e) => setForm({ ...form, amount: parseFloat(e.target.value) || 0 })}
+                  InputProps={{ readOnly: form.allocations.length > 0 }}
+                  helperText={form.allocations.length ? 'Total of the selected invoice allocations' : 'Used when no invoice is selected'} />
               </Grid>
               <Grid item xs={12} sm={6}>
                 <TextField fullWidth select label="Payment Method" value={form.paymentMethod}
@@ -256,7 +316,11 @@ export default function PaymentsPage() {
           </DialogContent>
           <DialogActions>
             <Button onClick={() => setDialogOpen(false)}>Cancel</Button>
-            <Button type="submit" variant="contained" disabled={saving}>{saving ? <CircularProgress size={20} /> : 'Create'}</Button>
+            <Button type="submit" variant="contained" disabled={saving || Boolean(validateAllocations(form.allocations, vendorInvoices.map((invoice) => ({
+              id: invoice.id,
+              documentNumber: invoice.documentNumber,
+              balance: invoiceBalance(invoice),
+            }))))}>{saving ? <CircularProgress size={20} /> : 'Create'}</Button>
           </DialogActions>
         </form>
       </Dialog>
@@ -279,14 +343,15 @@ export default function PaymentsPage() {
           remarks: viewPayment.notes,
           vatApplicable: false,
           total: Number(viewPayment.amount),
-          items: [{
-            description: viewPayment.purchaseInvoice
-              ? `Being payment against ${displayDocumentNumber(viewPayment.purchaseInvoice.documentNumber)}`
-              : 'Being payment to vendor',
-            quantity: 1,
-            unitPrice: Number(viewPayment.amount),
-            total: Number(viewPayment.amount),
-          }],
+          items: voucherViewItems(
+            Number(viewPayment.amount),
+            (viewPayment.allocations || []).map((line) => ({
+              amount: line.amount,
+              documentNumber: line.purchaseInvoice?.documentNumber,
+            })),
+            viewPayment.purchaseInvoice?.documentNumber,
+            'payment',
+          ),
         } : null}
         extraFields={viewPayment ? [
           { label: 'Payment Method', value: viewPayment.paymentMethod },
@@ -294,9 +359,13 @@ export default function PaymentsPage() {
             ? [{ label: 'Paid From', value: `${viewPayment.paymentAccount.code} — ${viewPayment.paymentAccount.name}` }]
             : []),
           ...(viewPayment.referenceNumber ? [{ label: 'Reference', value: viewPayment.referenceNumber }] : []),
-          ...(viewPayment.purchaseInvoice
-            ? [{ label: 'Invoice Ref', value: displayDocumentNumber(viewPayment.purchaseInvoice.documentNumber) }]
-            : []),
+          ...(() => {
+            const label = voucherInvoiceLabel(
+              (viewPayment.allocations || []).map((line) => ({ documentNumber: line.purchaseInvoice?.documentNumber })),
+              viewPayment.purchaseInvoice?.documentNumber,
+            );
+            return label === '-' ? [] : [{ label: (viewPayment.allocations?.length || 0) > 1 ? 'Invoices' : 'Invoice Ref', value: label }];
+          })(),
         ] : undefined}
         onDownload={viewPayment
           ? () => downloadPdf(viewPayment.id, viewPayment.documentNumber, viewPayment.vendor?.name || 'Vendor')

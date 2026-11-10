@@ -10,7 +10,11 @@ import PageHeader from '../../components/common/PageHeader';
 import DocumentTable from '../../components/common/DocumentTable';
 import DocumentDateField from '../../components/common/DocumentDateField';
 import DocumentViewDialog from '../../components/common/DocumentViewDialog';
+import InvoiceAllocationPicker from '../../components/common/InvoiceAllocationPicker';
 import { todayISO, formatDateDDMMYYYY } from '../../utils/date';
+import {
+  AllocationLine, allocationTotal, roundMoney, validateAllocations, voucherInvoiceLabel, voucherViewItems,
+} from '../../utils/voucherAllocations';
 
 interface Customer {
   id: string; name: string; code: string;
@@ -27,7 +31,9 @@ interface Receipt {
   preparedBy?: string | null; approvedBy?: string | null; status?: string;
   paymentAccountId?: string | null;
   paymentAccount?: { id: string; code: string; name: string } | null;
-  customer: Customer; salesInvoice?: { documentNumber: string } | null;
+  customer: Customer;
+  salesInvoice?: { documentNumber: string } | null;
+  allocations?: { amount: number | string; salesInvoice?: { documentNumber: string } | null }[];
 }
 
 interface FundAccount { id: string; code: string; name: string; }
@@ -61,10 +67,12 @@ export default function ReceiptsPage() {
   const [viewOpen, setViewOpen] = useState(false);
   const [viewReceipt, setViewReceipt] = useState<Receipt | null>(null);
   const [actionId, setActionId] = useState<string | null>(null);
-  const [form, setForm] = useState({
-    customerId: '', salesInvoiceId: '', date: todayISO(),
+  const emptyForm = () => ({
+    customerId: '', date: todayISO(),
     amount: 0, paymentMethod: 'CASH', paymentAccountId: '', referenceNumber: '', notes: '', preparedBy: '', approvedBy: '',
+    allocations: [] as AllocationLine[],
   });
+  const [form, setForm] = useState(emptyForm);
   const [saving, setSaving] = useState(false);
 
   const fetchData = async () => {
@@ -118,11 +126,42 @@ export default function ReceiptsPage() {
     setSaving(true);
     setError('');
     try {
+      if (!form.customerId) {
+        setError('Customer is required');
+        return;
+      }
+      const open = customerInvoices.map((invoice) => ({
+        id: invoice.id,
+        documentNumber: invoice.documentNumber,
+        balance: invoiceBalance(invoice),
+      }));
+      const allocationError = validateAllocations(form.allocations, open);
+      if (allocationError) {
+        setError(allocationError);
+        setSaving(false);
+        return;
+      }
+      const amount = form.allocations.length
+        ? allocationTotal(form.allocations)
+        : roundMoney(Number(form.amount));
+      if (!(amount > 0)) {
+        setError('Amount must be greater than zero');
+        setSaving(false);
+        return;
+      }
       await api.post('/sales/receipts', {
-        ...form,
-        salesInvoiceId: form.salesInvoiceId || undefined,
+        customerId: form.customerId,
+        date: form.date,
+        amount,
+        paymentMethod: form.paymentMethod,
         paymentAccountId: form.paymentAccountId || undefined,
-        amount: Number(form.amount),
+        referenceNumber: form.referenceNumber,
+        notes: form.notes,
+        preparedBy: form.preparedBy,
+        approvedBy: form.approvedBy,
+        allocations: form.allocations.length
+          ? form.allocations.map((line) => ({ salesInvoiceId: line.invoiceId, amount: roundMoney(line.amount) }))
+          : undefined,
       });
       setDialogOpen(false);
       setSuccess('Receipt created');
@@ -135,26 +174,15 @@ export default function ReceiptsPage() {
     }
   };
 
-  const customerInvoices = invoices.filter((i) => {
-    if (i.customerId !== form.customerId) return false;
-    if (i.status && !['CONFIRMED', 'PARTIALLY_PAID'].includes(i.status)) return false;
-    const balance = Number(i.total) - Number(i.paidAmount) - Number(i.creditedAmount ?? 0);
-    return balance > 0.001;
-  });
+  const invoiceBalance = (invoice: SalesInvoice) => roundMoney(
+    Number(invoice.total) - Number(invoice.paidAmount) - Number(invoice.creditedAmount ?? 0),
+  );
 
-  const selectInvoice = (invoiceId: string) => {
-    const inv = invoices.find((i) => i.id === invoiceId);
-    if (!inv) {
-      setForm({ ...form, salesInvoiceId: invoiceId });
-      return;
-    }
-    const balance = Number(inv.total) - Number(inv.paidAmount) - Number(inv.creditedAmount ?? 0);
-    setForm({
-      ...form,
-      salesInvoiceId: invoiceId,
-      amount: balance > 0 ? Number(balance.toFixed(2)) : form.amount,
-    });
-  };
+  const customerInvoices = invoices.filter((invoice) => {
+    if (invoice.customerId !== form.customerId) return false;
+    if (invoice.status && !['CONFIRMED', 'PARTIALLY_PAID'].includes(invoice.status)) return false;
+    return invoiceBalance(invoice) > 0.001;
+  }).sort((a, b) => a.documentNumber.localeCompare(b.documentNumber));
 
   const columns: GridColDef[] = [
     {
@@ -164,10 +192,13 @@ export default function ReceiptsPage() {
     { field: 'date', headerName: 'Date', width: 110, valueFormatter: (v) => formatDateDDMMYYYY(v as string) },
     { field: 'customer', headerName: 'Customer', flex: 1, valueGetter: (_, row) => (row as Receipt).customer?.name },
     {
-      field: 'invoice', headerName: 'Invoice', width: 140,
+      field: 'invoice', headerName: 'Invoices', width: 220,
       valueGetter: (_, row) => {
-        const inv = (row as Receipt).salesInvoice?.documentNumber;
-        return inv ? displayDocumentNumber(inv) : '-';
+        const receipt = row as Receipt;
+        const allocations = (receipt.allocations || []).map((line) => ({
+          documentNumber: line.salesInvoice?.documentNumber,
+        }));
+        return voucherInvoiceLabel(allocations, receipt.salesInvoice?.documentNumber);
       },
     },
     { field: 'amount', headerName: 'Amount', width: 110, type: 'number' },
@@ -195,10 +226,8 @@ export default function ReceiptsPage() {
     <Box>
       <PageHeader title="Receipts" subtitle="Customer payment receipts" actionLabel="New Receipt"
         onAction={() => {
-          setForm({
-            customerId: '', salesInvoiceId: '', date: todayISO(),
-            amount: 0, paymentMethod: 'CASH', paymentAccountId: '', referenceNumber: '', notes: '', preparedBy: '', approvedBy: '',
-          });
+          setError('');
+          setForm(emptyForm());
           setDialogOpen(true);
         }} />
 
@@ -207,34 +236,46 @@ export default function ReceiptsPage() {
 
       <DocumentTable rows={receipts} columns={columns} loading={loading} />
 
-      <Dialog open={dialogOpen} onClose={() => setDialogOpen(false)} maxWidth="sm" fullWidth>
+      <Dialog open={dialogOpen} onClose={() => setDialogOpen(false)} maxWidth="md" fullWidth>
         <form onSubmit={handleCreate}>
           <DialogTitle>New Receipt</DialogTitle>
           <DialogContent>
+            {error && <Alert severity="error" sx={{ mt: 1 }}>{error}</Alert>}
             <Grid container spacing={2} sx={{ mt: 0.5 }}>
               <Grid item xs={12}>
                 <Autocomplete options={customers} getOptionLabel={(c) => `${c.code} - ${c.name}`}
                   value={customers.find((c) => c.id === form.customerId) || null}
-                  onChange={(_, v) => setForm({ ...form, customerId: v?.id || '', salesInvoiceId: '' })}
+                  onChange={(_, v) => setForm({
+                    ...form,
+                    customerId: v?.id || '',
+                    allocations: [],
+                    amount: form.allocations.length ? 0 : form.amount,
+                  })}
                   renderInput={(params) => <TextField {...params} required label="Customer" />} />
               </Grid>
               <Grid item xs={12}>
-                <TextField fullWidth select label="Sales Invoice" value={form.salesInvoiceId}
-                  onChange={(e) => selectInvoice(e.target.value)}
-                  helperText={form.salesInvoiceId ? 'Amount set to invoice balance' : 'Leave empty to auto-allocate to oldest open invoices'}>
-                  <MenuItem value="">Auto-allocate (oldest first)</MenuItem>
-                  {customerInvoices.map((i) => (
-                    <MenuItem key={i.id} value={i.id}>
-                      {displayDocumentNumber(i.documentNumber)} (Balance: {(
-                        Number(i.total) - Number(i.paidAmount) - Number(i.creditedAmount ?? 0)
-                      ).toFixed(2)})
-                    </MenuItem>
-                  ))}
-                </TextField>
+                <InvoiceAllocationPicker
+                  label="Sales Invoices"
+                  partyNoun="customer"
+                  partySelected={Boolean(form.customerId)}
+                  invoices={customerInvoices.map((invoice) => ({
+                    id: invoice.id,
+                    documentNumber: invoice.documentNumber,
+                    balance: invoiceBalance(invoice),
+                  }))}
+                  value={form.allocations}
+                  onChange={(allocations) => setForm({
+                    ...form,
+                    allocations,
+                    amount: allocations.length ? allocationTotal(allocations) : form.amount,
+                  })}
+                />
               </Grid>
               <Grid item xs={12} sm={6}>
-                <TextField fullWidth required label="Amount" type="number" value={form.amount}
-                  onChange={(e) => setForm({ ...form, amount: parseFloat(e.target.value) || 0 })} />
+                <TextField fullWidth required label="Amount" type="number" value={form.allocations.length ? allocationTotal(form.allocations) : form.amount}
+                  onChange={(e) => setForm({ ...form, amount: parseFloat(e.target.value) || 0 })}
+                  InputProps={{ readOnly: form.allocations.length > 0 }}
+                  helperText={form.allocations.length ? 'Total of the selected invoice allocations' : 'Used when no invoice is selected'} />
               </Grid>
               <Grid item xs={12} sm={6}>
                 <TextField fullWidth select label="Payment Method" value={form.paymentMethod}
@@ -277,7 +318,11 @@ export default function ReceiptsPage() {
           </DialogContent>
           <DialogActions>
             <Button onClick={() => setDialogOpen(false)}>Cancel</Button>
-            <Button type="submit" variant="contained" disabled={saving}>{saving ? <CircularProgress size={20} /> : 'Create'}</Button>
+            <Button type="submit" variant="contained" disabled={saving || Boolean(validateAllocations(form.allocations, customerInvoices.map((invoice) => ({
+              id: invoice.id,
+              documentNumber: invoice.documentNumber,
+              balance: invoiceBalance(invoice),
+            }))))}>{saving ? <CircularProgress size={20} /> : 'Create'}</Button>
           </DialogActions>
         </form>
       </Dialog>
@@ -300,14 +345,15 @@ export default function ReceiptsPage() {
           remarks: viewReceipt.notes,
           vatApplicable: false,
           total: Number(viewReceipt.amount),
-          items: [{
-            description: viewReceipt.salesInvoice
-              ? `Being receipt against ${displayDocumentNumber(viewReceipt.salesInvoice.documentNumber)}`
-              : 'Being receipt from customer',
-            quantity: 1,
-            unitPrice: Number(viewReceipt.amount),
-            total: Number(viewReceipt.amount),
-          }],
+          items: voucherViewItems(
+            Number(viewReceipt.amount),
+            (viewReceipt.allocations || []).map((line) => ({
+              amount: line.amount,
+              documentNumber: line.salesInvoice?.documentNumber,
+            })),
+            viewReceipt.salesInvoice?.documentNumber,
+            'receipt',
+          ),
         } : null}
         extraFields={viewReceipt ? [
           { label: 'Payment Method', value: viewReceipt.paymentMethod },
@@ -315,9 +361,13 @@ export default function ReceiptsPage() {
             ? [{ label: 'Received Into', value: `${viewReceipt.paymentAccount.code} — ${viewReceipt.paymentAccount.name}` }]
             : []),
           ...(viewReceipt.referenceNumber ? [{ label: 'Reference', value: viewReceipt.referenceNumber }] : []),
-          ...(viewReceipt.salesInvoice
-            ? [{ label: 'Invoice Ref', value: displayDocumentNumber(viewReceipt.salesInvoice.documentNumber) }]
-            : []),
+          ...(() => {
+            const label = voucherInvoiceLabel(
+              (viewReceipt.allocations || []).map((line) => ({ documentNumber: line.salesInvoice?.documentNumber })),
+              viewReceipt.salesInvoice?.documentNumber,
+            );
+            return label === '-' ? [] : [{ label: (viewReceipt.allocations?.length || 0) > 1 ? 'Invoices' : 'Invoice Ref', value: label }];
+          })(),
         ] : undefined}
         onDownload={viewReceipt
           ? () => downloadPdf(viewReceipt.id, viewReceipt.documentNumber, viewReceipt.customer?.name || 'Customer')
